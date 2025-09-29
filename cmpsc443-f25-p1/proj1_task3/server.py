@@ -8,21 +8,24 @@ import struct
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 import srp
-
 from util import (
     set_session_key,
     secure_send_msg,
     secure_receive_msg,
     send_framed,
     recv_framed,
+    PORT,
+    SEPARATOR
 )
+SRP_HASH = srp.SHA256
+SRP_NG   = srp.NG_2048
+
 
 # --- Configuration ---
-HOST = '127.0.0.1'   # loopback
-PORT = 65431
-VALID_IDS_FILE = "server_folder/valid_ids.txt"
-SERVER_STORAGE = "server_folder/server_files"
-SEPARATOR = ","
+HOST = '127.0.0.1'  # Standard loopback interface address (localhost)
+# DEFAULT_IDS = {"user1", "user2", "admin"} # Default IDs if no file exists
+VALID_IDS_FILE = "server_folder/valid_ids.txt" # File to store valid user IDs
+SERVER_STORAGE = "server_folder/server_files" # Directory to store files received from clients
 
 # --- Functions for User ID Persistence ---
 ''' TODO (Step 2): 
@@ -39,7 +42,6 @@ def load_valid_ids():
     ids = {}
     with open(VALID_IDS_FILE, "r") as f:
         for line in f:
-            # Expected format: user<SEP>salt_hex<SEP>verifier_hex
             parts = line.strip().split(SEPARATOR)
             if len(parts) == 3:
                 user, salt_hex, vkey_hex = parts
@@ -62,7 +64,9 @@ print("--- Server ---")
 VALID_IDS = load_valid_ids()
 
 # Create the server storage directory if it doesn't exist
-os.makedirs(SERVER_STORAGE, exist_ok=True)
+if not os.path.exists(SERVER_STORAGE):
+    os.makedirs(SERVER_STORAGE)
+    print(f"Created directory: {SERVER_STORAGE}")
 
 # 1. Create a socket object
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -83,6 +87,14 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             TODO (Step 1):
             We need to establish a shared symmetric key between the server and client.
             This will be done using public-key cryptography (e.g., RSA). 
+
+            Steps:
+            1. Server generates a public/private key pair.
+            2. User gets the public key for server. (We assume this is done in advance)
+            3. Client generates a symmetric key (e.g., for AES) and encrypts it with the server's public key.
+            4. Client sends the encrypted symmetric key to the server.
+            5. Server decrypts the symmetric key using its private key.
+            6. Both server and client now use this symmetric key for encrypting/decrypting further communication.
         '''
         # ---- your code here   ----
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -91,13 +103,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        # Send server public key (length-prefixed)
         send_framed(conn, pub_pem)
-
-        # Receive RSA-OAEP encrypted session key (length-prefixed)
         enc_session = recv_framed(conn)
 
-        # Decrypt session key
         session_key = private_key.decrypt(
             enc_session,
             padding.OAEP(
@@ -110,7 +118,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 
         # DO NOT CHANGE THE PRINT STATEMENT BELOW. PRINT THE SESSION KEY IF SUCCESSFULLY RECEIVED.
         print(f"Decrypted session key: {session_key.hex()}") 
-        # ---- your code end here  ----
 
         '''
             TODO (Step 1): 
@@ -126,13 +133,10 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         '''
 
         # --- your code here   ----
-        # --- SRP phase: expect one of: REGISTER or AUTH ---
         first_line = secure_receive_msg(conn).decode('utf-8')
 
-        # REGISTER flow: "REGISTER <user_id>"
         if first_line.startswith("REGISTER "):
             user_id = first_line.split(" ", 1)[1].strip()
-            # Expect: client sends "s=<hex> v=<hex>"
             reg_payload = secure_receive_msg(conn).decode('utf-8')
             try:
                 parts = dict(kv.split("=", 1) for kv in reg_payload.strip().split())
@@ -150,7 +154,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             secure_send_msg(conn, b"REG_OK")
             authenticated_user = user_id
 
-        # AUTH flow (two-step):
         elif first_line.startswith("AUTH "):
             toks = first_line.split()
             if len(toks) != 3:
@@ -159,10 +162,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             user_id, A_hex = toks[1], toks[2]
 
             if user_id not in VALID_IDS:
-                # Tell client and WAIT for REGISTER sequence (no exit)
                 secure_send_msg(conn, b"AUTH_NOUSER")
-
-                # Expect: "REGISTER <user_id>"
                 reg_cmd = secure_receive_msg(conn).decode('utf-8')
                 if not reg_cmd.startswith("REGISTER "):
                     secure_send_msg(conn, b"PROTO_ERROR")
@@ -175,37 +175,34 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 authenticated_user = reg_user
 
             else:
-                # Normal SRP login
                 salt_hex, vkey_hex = VALID_IDS[user_id]
                 salt = binascii.unhexlify(salt_hex)
                 vkey = binascii.unhexlify(vkey_hex)
                 A = binascii.unhexlify(A_hex)
+                vrf = srp.Verifier(user_id, salt, vkey, A, hash_alg=SRP_HASH, ng_type=SRP_NG)
+                s_salt, B = vrf.get_challenge()  
 
-                vrf = srp.Verifier(user_id, salt, vkey, A)
-                s_salt, B = vrf.get_challenge()  # s_salt is same as stored salt
                 if B is None:
                     secure_send_msg(conn, b"AUTH_FAIL")
                     conn.close(); raise SystemExit
-
-                # Send challenge back
+   
                 challenge = f"s={binascii.hexlify(s_salt).decode()} B={binascii.hexlify(B).decode()}".encode()
                 secure_send_msg(conn, challenge)
 
-                # Receive client's proof M
                 proof_msg = secure_receive_msg(conn).decode('utf-8')
                 try:
-                    M_hex = proof_msg.split("=",1)[1]
+                    M_hex = proof_msg.split("=",1)[1].strip()  # <-- strip whitespace
                     M = binascii.unhexlify(M_hex)
+
                 except Exception:
                     secure_send_msg(conn, b"AUTH_ERROR")
                     conn.close(); raise SystemExit
-
-                HAMK = vrf.verify(M)
+                HAMK = vrf.verify_session(M)
                 if HAMK is None:
                     secure_send_msg(conn, b"AUTH_FAIL")
-                    conn.close(); raise SystemExit
+                    conn.close()
+                    raise SystemExit
 
-                # Success
                 secure_send_msg(conn, f"HAMK={binascii.hexlify(HAMK).decode()}".encode())
                 authenticated_user = user_id
 
@@ -254,7 +251,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     # Receive file blob (already framed & encrypted on client)
                     data = secure_receive_msg(conn)
 
-                    # NOTE: For Step 3, server stores the encrypted blob AS-IS (no decrypt on server)
                     with open(filepath, "wb") as f:
                         f.write(data)
                     print(f"File '{filename}' received and saved to '{filepath}'.")
