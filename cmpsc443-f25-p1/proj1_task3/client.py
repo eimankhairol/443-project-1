@@ -81,6 +81,7 @@ def decrypt_file_blob(password: str, blob: bytes) -> bytes:
     key = derive_file_key(password, salt)
     aesccm = AESCCM(key)
     return aesccm.decrypt(nonce, ct, None)
+    ################################################
 
 # 1. Create a socket object
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
