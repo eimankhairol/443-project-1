@@ -28,8 +28,8 @@ from util import (
 HOST = '127.0.0.1'  # The server's hostname or IP address
 DOWNLOAD_FOLDER = "client_folder/downloaded" # Folder to save downloaded files
 SEND_FOLDER = "client_folder/filestosend"    # Folder containing files to send
-SRP_HASH = srp.SHA256
-SRP_NG   = srp.NG_2048
+SRP_HASH = srp.SHA256 # Hash algo for SRP
+SRP_NG   = srp.NG_2048  # Group paremeters for SRP
 
 print("--- Client ---")
 
@@ -45,6 +45,10 @@ if not os.path.exists(SEND_FOLDER):
 
 # ===== Helper Functions =====
 def derive_file_key(password: str, salt: bytes) -> bytes:
+    """
+    Derive a 256-bit key from password+salt using PBKDF2-HMAC-SHA256.
+    This ensures a unique key per file since salt is random per file.
+    """
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
@@ -55,6 +59,10 @@ def derive_file_key(password: str, salt: bytes) -> bytes:
     return kdf.derive(password.encode('utf-8'))
 
 def encrypt_file_blob(password: str, plaintext: bytes) -> bytes:
+    """
+    Encrypt a file with AES-CCM using a key derived from password+salt.
+    Blob format: salt(16) || nonce(13) || ciphertext+tag
+    """
     salt = os.urandom(16)
     key = derive_file_key(password, salt)
     aesccm = AESCCM(key)
@@ -63,6 +71,10 @@ def encrypt_file_blob(password: str, plaintext: bytes) -> bytes:
     return salt + nonce + ct
 
 def decrypt_file_blob(password: str, blob: bytes) -> bytes:
+    """
+    Decrypt a previously encrypted file blob.
+    Splits into salt, nonce, ciphertext+tag, then recomputes the key and decrypts.
+    """
     if len(blob) < 29:
         raise ValueError("Corrupted blob")
     salt, nonce, ct = blob[:16], blob[16:29], blob[29:]
@@ -81,9 +93,12 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             after connecting, need to derive session keys, and securely exchange them with the server
         '''
         # ---- your code here   ----
+        # Establishing secure channel
+        # Receive server public key, RSA
         server_pub_pem = recv_framed(s)
         server_pubkey = serialization.load_pem_public_key(server_pub_pem)
 
+        # Generate session key and encrypt with server's RSA public key
         session_key = os.urandom(32)
         enc_session = server_pubkey.encrypt(
             session_key,
@@ -94,7 +109,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             )
         )
         send_framed(s, enc_session)
-
         set_session_key(session_key)
 
         # DO NOT CHANGE THE PRINT STATEMENT BELOW. PRINT SESSION KEY IF SUCCESSFULLY GENERATED.
@@ -107,6 +121,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             Client should never send plaintext passwords. 
             Think about the difference between registering a new ID and logging in with an existing ID.
         '''
+        # User AUth for SRP
         user_id = input("Enter your user ID: ").strip()
         password = input("Enter your password: ").strip()
         #   Filter your id to only allow a combination of of alphanumeric characters [0-9a-zA-Z], and length to be between 2-20 characters.
@@ -119,6 +134,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             sys.exit() 
 
         # ---- your code here   ----
+        # Start SRP authentication
         usr = srp.User(user_id, password, hash_alg=SRP_HASH, ng_type=SRP_NG)
         _, A = usr.start_authentication()
         secure_send_msg(s, f"AUTH {user_id} {binascii.hexlify(A).decode()}".encode('utf-8'))
@@ -126,6 +142,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         challenge = secure_receive_msg(s).decode('utf-8')
         
         if challenge.startswith("AUTH_NOUSER"):
+            # New user registration
             salt, vkey = srp.create_salted_verification_key(user_id, password, hash_alg=SRP_HASH, ng_type=SRP_NG)
             salt_hex = binascii.hexlify(salt).decode()
             vkey_hex = binascii.hexlify(vkey).decode()
@@ -137,12 +154,14 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 sys.exit()
             print("Authentication Successful.")  
         else:
+            # Existing user login flow
             parts = dict(kv.split("=", 1) for kv in challenge.strip().split())
             s_hex = parts["s"].strip()    
             B_hex = parts["B"].strip()
             s_salt = binascii.unhexlify(s_hex)
             B      = binascii.unhexlify(B_hex)
-
+            
+            # Process challeenge to compute client proof
             M = usr.process_challenge(s_salt, B)
             if M is None:
                 print("Authentication Failed.")
@@ -150,16 +169,15 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 
             secure_send_msg(s, f"M={binascii.hexlify(M).decode()}".encode('utf-8'))
 
+            # Verify server proof
             proof = secure_receive_msg(s).decode('utf-8')
             if proof.startswith("HAMK="):
                 hamk_hex = proof.split("=", 1)[1].strip()
                 HAMK = binascii.unhexlify(hamk_hex)
-
                 usr.verify_session(HAMK)   # updates state
 
-
                 if usr.authenticated():
-                    print("Authentication Successful.")   # required
+                    print("Authentication Successful.")   
                 else:
                     print("Authentication Failed.")
                     sys.exit()
@@ -175,6 +193,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             You should use key derivation function PBKDF2
         '''
         # --- Command Loop ---
+        # File transfer
+    
         while True:
             user_input = input(f"{user_id}> ")
             if not user_input:
@@ -189,6 +209,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 break
 
             elif command == "send":
+                # Send file to server, is encrypted on client side
                 filename = parts[1]
                 filepath = os.path.join(SEND_FOLDER, os.path.basename(filename))
                 if not os.path.exists(filepath):
@@ -217,6 +238,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         print(f"Server: {confirmation}")
 
             elif command == "get":
+                # Download a file from server, decrypt on client side)
                 filename = parts[1]
                 save_path = os.path.join(DOWNLOAD_FOLDER, os.path.basename(filename))
                 
@@ -232,7 +254,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     '''TODO (Step 3): decode the file (Secrecy and Integrity)'''
                     # ---- your code here   ----
                     try:
-                        decrypted = decrypt_file_blob(password, data)  # derive key via salt in blob, decrypt with AES-CCM
+                        decrypted = decrypt_file_blob(password, data)  # Derive key via salt in blob, decrypt with AES-CCM
                     except Exception as e:
                         print(f"Decryption failed: {e}")
                         continue
